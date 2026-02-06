@@ -339,8 +339,9 @@ static apr_array_header_t *parse_want_digest_header(request_rec *r,
          token != NULL;
          token = apr_strtok(NULL, ",", &last)) {
 
-        char *algo_name, *weight_str, *eq_pos;
+        char *algo_name, *weight_str, *eq_pos, *end, *endptr;
         const content_digest_algo *algo;
+        want_digest_pref *pref;
         double weight = 1.0;
         int is_configured = 0;
 
@@ -353,7 +354,7 @@ static apr_array_header_t *parse_want_digest_header(request_rec *r,
             /* No weight specified, default to 1.0 */
             algo_name = token;
             /* Trim trailing whitespace */
-            char *end = algo_name + strlen(algo_name) - 1;
+            end = algo_name + strlen(algo_name) - 1;
             while (end > algo_name && (*end == ' ' || *end == '\t')) {
                 *end-- = '\0';
             }
@@ -363,7 +364,7 @@ static apr_array_header_t *parse_want_digest_header(request_rec *r,
             weight_str = eq_pos + 1;
 
             /* Trim trailing whitespace from algo name */
-            char *end = algo_name + strlen(algo_name) - 1;
+            end = algo_name + strlen(algo_name) - 1;
             while (end > algo_name && (*end == ' ' || *end == '\t')) {
                 *end-- = '\0';
             }
@@ -372,7 +373,10 @@ static apr_array_header_t *parse_want_digest_header(request_rec *r,
             while (*weight_str == ' ' || *weight_str == '\t') weight_str++;
 
             /* Parse weight (0.0 to 1.0) */
-            weight = strtod(weight_str, NULL);
+            weight = strtod(weight_str, &endptr);
+            if (endptr == weight_str) {
+                continue;  /* No valid number parsed, skip */
+            }
             if (weight < 0.0) weight = 0.0;
             if (weight > 1.0) weight = 1.0;
         }
@@ -403,7 +407,7 @@ static apr_array_header_t *parse_want_digest_header(request_rec *r,
         }
 
         /* Add to preferences */
-        want_digest_pref *pref = (want_digest_pref *)apr_array_push(prefs);
+        pref = (want_digest_pref *)apr_array_push(prefs);
         pref->algo = algo;
         pref->weight = weight;
     }
@@ -441,7 +445,7 @@ static const char *parse_checksum_file(request_rec *r, const char *sidecar_path,
     apr_status_t rv;
     char buf[CHECKSUM_MAX_FILE_SIZE + 1];
     apr_size_t bytes_read;
-    char *p, *hex_start = NULL;
+    char *p, *hex_start = NULL, *found_hex_start = NULL;
     int in_hex = 0;
     int hex_len = 0;
     char *result;
@@ -486,7 +490,6 @@ static const char *parse_checksum_file(request_rec *r, const char *sidecar_path,
 
     /* Scan for hex sequences of exact expected length.
      * Save the first valid match in found_hex_start; reject if we find a second. */
-    char *found_hex_start = NULL;
     p = buf;
     while (*p != '\0') {
         if (is_hex_char(*p)) {
@@ -666,6 +669,7 @@ static int content_digest_fixup_handler(request_rec *r)
                 parse_want_digest_header(r, want_header, algorithms);
             if (client_prefs != NULL && client_prefs->nelts > 0) {
                 algorithms = client_prefs;
+                apr_table_mergen(r->headers_out, "Vary", "Want-Content-Digest");
                 ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
                     "mod_digest_fields: using client algorithm preferences from Want-Content-Digest");
             }
@@ -703,15 +707,17 @@ static int content_digest_fixup_handler(request_rec *r)
     /* Also check for Repr-Digest if enabled */
     if (conf->repr_digest_enabled == 1) {
         const char *base_filename;
+        const char *want_repr_header;
         apr_array_header_t *repr_algorithms = algorithms;
 
         /* Check for Want-Repr-Digest header */
-        const char *want_repr_header = apr_table_get(r->headers_in, "Want-Repr-Digest");
+        want_repr_header = apr_table_get(r->headers_in, "Want-Repr-Digest");
         if (want_repr_header != NULL) {
             apr_array_header_t *repr_prefs =
                 parse_want_digest_header(r, want_repr_header, algorithms);
             if (repr_prefs != NULL && repr_prefs->nelts > 0) {
                 repr_algorithms = repr_prefs;
+                apr_table_mergen(r->headers_out, "Vary", "Want-Repr-Digest");
                 ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
                     "mod_digest_fields: using client algorithm preferences from Want-Repr-Digest");
             }

@@ -8,5 +8,22 @@
 *.lai
 .libs/
 
+# macOS
+.DS_Store
+
+# Editor swap/backup files
+*.swp
+*.swo
+*~
+.*.swp
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
 # Claude Code local settings
 .claude/settings.local.json

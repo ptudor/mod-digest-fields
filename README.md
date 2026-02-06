@@ -84,7 +84,12 @@ No dependencies beyond Python 3. Here's the full script ([verify.py](verify.py))
 
 ```python
 #!/usr/bin/env python3
-"""Verify a download using RFC 9530 Content-Digest headers."""
+"""
+Verify a download using RFC 9530 Content-Digest headers.
+
+Usage:
+    python3 verify.py https://example.com/files/archive.tar.gz
+"""
 
 import hashlib, base64, re, sys, urllib.request
 
@@ -105,6 +110,10 @@ def parse_content_digest(header):
         return None, None
     return m.group(1), base64.b64decode(m.group(2))
 
+if len(sys.argv) != 2:
+    print(f"Usage: {sys.argv[0]} <url>")
+    sys.exit(1)
+
 # Step 1: Download the file and grab the Content-Digest header
 url = sys.argv[1]
 print(f"Fetching {url} ...")
@@ -116,12 +125,16 @@ with urllib.request.urlopen(req) as resp:
 
 if not header:
     print("No Content-Digest header in response.")
+    print("(Server may not have a sidecar checksum for this file.)")
     sys.exit(1)
 
 print(f"Content-Digest: {header}")
 
 # Step 2: Parse the header to get the algorithm and the expected hash
 algo_name, expected = parse_content_digest(header)
+if not algo_name:
+    print(f"Could not parse header: {header}")
+    sys.exit(1)
 
 # Step 3: Hash the bytes we actually received
 actual = ALGORITHMS[algo_name](body).digest()
