@@ -348,6 +348,11 @@ static apr_array_header_t *parse_want_digest_header(request_rec *r,
         /* Skip leading whitespace */
         while (*token == ' ' || *token == '\t') token++;
 
+        /* Skip empty tokens (e.g., from ",  ,") */
+        if (*token == '\0') {
+            continue;
+        }
+
         /* Find equals sign */
         eq_pos = strchr(token, '=');
         if (eq_pos == NULL) {
@@ -372,13 +377,20 @@ static apr_array_header_t *parse_want_digest_header(request_rec *r,
             /* Skip leading whitespace on weight */
             while (*weight_str == ' ' || *weight_str == '\t') weight_str++;
 
-            /* Parse weight (0.0 to 1.0) */
+            /* Parse weight (0.0 to 1.0) per RFC 8941 §3.3.7 */
             weight = strtod(weight_str, &endptr);
             if (endptr == weight_str) {
                 continue;  /* No valid number parsed, skip */
             }
-            if (weight < 0.0) weight = 0.0;
-            if (weight > 1.0) weight = 1.0;
+            /* Reject trailing non-whitespace junk (e.g., "0.5xyz") */
+            while (*endptr == ' ' || *endptr == '\t') endptr++;
+            if (*endptr != '\0') {
+                continue;
+            }
+            /* Reject out-of-range weights per RFC 8941 §3.3.7 */
+            if (weight < 0.0 || weight > 1.0) {
+                continue;
+            }
         }
 
         /* Look up algorithm */
@@ -611,6 +623,7 @@ static int content_digest_fixup_handler(request_rec *r)
     content_digest_dir_config *conf;
     apr_finfo_t finfo;
     apr_array_header_t *algorithms;
+    apr_array_header_t *configured_algorithms;
     const content_digest_algo *default_algo;
     int i;
 
@@ -638,6 +651,12 @@ static int content_digest_fixup_handler(request_rec *r)
         return DECLINED;
     }
 
+    /* Skip if client sent Range header - response may be partial content (206),
+     * and our sidecar digest covers the full file, not the byte range */
+    if (apr_table_get(r->headers_in, "Range") != NULL) {
+        return DECLINED;
+    }
+
     /* Check filename match regex if configured */
     if (conf->match_regex != NULL) {
         const char *basename = strrchr(r->filename, '/');
@@ -660,6 +679,10 @@ static int content_digest_fixup_handler(request_rec *r)
         algorithms = apr_array_make(r->pool, 1, sizeof(const content_digest_algo *));
         *(const content_digest_algo **)apr_array_push(algorithms) = default_algo;
     }
+
+    /* Save configured algorithm list before Want-Content-Digest may override it.
+     * This is needed so Repr-Digest uses the server config, not client mutations. */
+    configured_algorithms = algorithms;
 
     /* Check for Want-Content-Digest header (RFC 9530) */
     {
@@ -696,6 +719,9 @@ static int content_digest_fixup_handler(request_rec *r)
         /* Success - add Content-Digest header */
         header_value = format_header_value(r, algo, hex_hash);
         apr_table_set(r->headers_out, "Content-Digest", header_value);
+        /* A compression filter may change the bytes on the wire, so the
+         * Content-Digest varies by encoding */
+        apr_table_mergen(r->headers_out, "Vary", "Accept-Encoding");
 
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
             "mod_digest_fields: added Content-Digest: %s for %s",
@@ -708,13 +734,13 @@ static int content_digest_fixup_handler(request_rec *r)
     if (conf->repr_digest_enabled == 1) {
         const char *base_filename;
         const char *want_repr_header;
-        apr_array_header_t *repr_algorithms = algorithms;
+        apr_array_header_t *repr_algorithms = configured_algorithms;
 
         /* Check for Want-Repr-Digest header */
         want_repr_header = apr_table_get(r->headers_in, "Want-Repr-Digest");
         if (want_repr_header != NULL) {
             apr_array_header_t *repr_prefs =
-                parse_want_digest_header(r, want_repr_header, algorithms);
+                parse_want_digest_header(r, want_repr_header, configured_algorithms);
             if (repr_prefs != NULL && repr_prefs->nelts > 0) {
                 repr_algorithms = repr_prefs;
                 apr_table_mergen(r->headers_out, "Vary", "Want-Repr-Digest");
