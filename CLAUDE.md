@@ -125,7 +125,8 @@ DigestFieldsCompression gz bz2 zst lzfse
     DigestFields On
 </Directory>
 ```
-Output: `Content-Digest: sha-256=:base64hash:`
+Output (no compression): `Content-Digest: sha-256=:base64hash:`
+Output (with mod_deflate): `Repr-Digest: sha-256=:base64hash:`
 
 ### Compressed files with Repr-Digest
 ```apache
@@ -150,16 +151,24 @@ Repr-Digest: sha-256=:uncompressedBase64:
 </Directory>
 ```
 
-### Mirror server (disable mod_deflate)
+### Mirror server (pre-compressed archives)
 ```apache
 # For mirror servers serving pre-compressed archives with integrity verification.
-# mod_deflate MUST be disabled to ensure Content-Digest matches the bytes sent.
+# no-gzip/no-brotli prevents double-compression of already-compressed files.
 <Directory "/var/www/mirror">
     DigestFields On
-
-    # Disable on-the-fly compression - files are already compressed
+    DigestFieldsRepr On
     SetEnv no-gzip 1
     SetEnv no-brotli 1
+</Directory>
+```
+
+### Static site with mod_deflate
+```apache
+# mod_deflate compresses .js/.css on the fly. The module automatically
+# emits Repr-Digest (not Content-Digest) for compressed responses.
+<Directory "/usr/local/www/my-app">
+    DigestFields On
 </Directory>
 ```
 
@@ -171,7 +180,6 @@ Repr-Digest: sha-256=:uncompressedBase64:
 <Directory "/var/www/mirror">
     DigestFields On
     DigestFieldsDirectory .checksum
-    SetEnv no-gzip 1
 </Directory>
 ```
 
@@ -195,32 +203,48 @@ If a client requests `sha-512=1, sha-256=0.5`, the server will prefer SHA-512 if
 
 ## Implementation Notes
 
-### Module Hooks
-- Register as `fixup` handler (after URI translation, before content generation)
+### Module Hooks (Two-Phase Architecture)
+
+The module uses a two-phase approach to correctly handle on-the-fly compression:
+
+**Phase 1: Fixup handler** (`ap_hook_fixups`, `APR_HOOK_MIDDLE`)
+- Runs after URI translation, before content generation
 - Only handles main requests, not subrequests
-- Check if request is for a regular file (stat)
-- Stat the sidecar file(s)
-- Read and parse checksum (hex)
-- Convert hex to binary, then binary to base64 per RFC 8941
-- Add header via `apr_table_set(r->headers_out, ...)`
+- Checks if request is for a regular file (stat)
+- Looks up sidecar file(s) and parses checksum (hex → binary → base64)
+- Stashes computed digest values in `r->notes` (not `r->headers_out`)
+- Adds the output filter to the chain only if a digest was found
+
+**Phase 2: Output filter** (`AP_FTYPE_PROTOCOL`)
+- Runs after mod_deflate (`AP_FTYPE_CONTENT_SET`) has set `Content-Encoding`
+- Checks `r->headers_out` for `Content-Encoding` to determine header name:
+  - **No encoding**: sidecar hash → `Content-Digest` (bytes on wire = file on disk)
+  - **Encoding present**: sidecar hash → `Repr-Digest` (hash of representation before encoding)
+- Emits `Repr-Digest` from DigestFieldsRepr sidecar if set (pre-compressed archives)
+- Removes itself from the filter chain after first invocation
 
 ### Performance Considerations
 - One stat per algorithm tried for sidecar lookup (stops at first found)
 - Checksum file read only when sidecar exists
 - Single-line-only parsing keeps reads minimal
 - No caching of parsed checksums; each request re-reads the sidecar file
+- Output filter is only added to the chain when a sidecar was found
 
-### mod_deflate / mod_brotli Incompatibility
+### mod_deflate / mod_brotli Compatibility
 
-**Important:** This module requires that on-the-fly compression be disabled for directories where `DigestFields` is enabled. When Apache compresses a response dynamically, the `Content-Digest` header will contain the hash of the *original file*, not the compressed bytes the client receives - causing validation failures.
+The module is fully compatible with on-the-fly compression (mod_deflate, mod_brotli). When compression is applied, the module automatically emits the sidecar hash as `Repr-Digest` instead of `Content-Digest`, which is the correct RFC 9530 semantic -- the sidecar hash represents the selected representation before content-encoding.
 
-**Solution:** Disable compression for these directories:
+| Scenario | Content-Encoding | Header Emitted | Hash Of |
+|----------|-----------------|----------------|---------|
+| No compression | *(none)* | `Content-Digest` | File on disk (= bytes on wire) |
+| mod_deflate/brotli | gzip/br | `Repr-Digest` | File on disk (= representation before encoding) |
+| Pre-compressed archive | *(none)* | `Content-Digest` | Compressed file on disk (= bytes on wire) |
+
+For mirror servers serving pre-compressed archives, you may still want to disable on-the-fly compression as a precaution (to prevent double-compression of already-compressed files):
 ```apache
 SetEnv no-gzip 1
 SetEnv no-brotli 1
 ```
-
-This is the expected configuration for mirror servers serving pre-compressed archives (`.tar.gz`, `.tar.xz`, `.tar.zst`, etc.) where the sidecar `.sha256` files contain hashes of the compressed archives as they exist on disk.
 
 ### Symlink Behavior
 

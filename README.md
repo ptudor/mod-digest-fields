@@ -192,10 +192,10 @@ The module uses **sidecar files** -- small text files containing a checksum, sto
 
 When a request arrives for `data.json`, the module:
 
-1. Checks if `data.json.sha256` exists
-2. Reads the hex hash from it
-3. Converts hex to base64 per RFC 8941
-4. Adds the `Content-Digest` header to the response
+1. **Fixup phase**: Checks if `data.json.sha256` exists, reads and parses the hex hash, converts to base64 per RFC 8941, and stashes the result in request notes
+2. **Output filter phase**: Runs after mod_deflate/mod_brotli. Checks `Content-Encoding` to pick the correct header:
+   - No compression: emits `Content-Digest` (hash matches bytes on the wire)
+   - Compressed (gzip/br): emits `Repr-Digest` (hash is of the representation before encoding)
 
 If no sidecar exists, no header is added. No errors, no noise.
 
@@ -316,7 +316,7 @@ The module respects client weights, filtered to algorithms configured on the ser
 
 ### Mirror server
 
-Pre-compressed archives with integrity verification. Disable on-the-fly compression so the `Content-Digest` matches the bytes on the wire.
+Pre-compressed archives with integrity verification. Disabling on-the-fly compression prevents double-compression of already-compressed files.
 
 ```apache
 <Directory "/var/www/mirror">
@@ -325,6 +325,16 @@ Pre-compressed archives with integrity verification. Disable on-the-fly compress
     DigestFieldsMatch "\.(tar\.gz|tar\.xz|tar\.zst|zip)$"
     SetEnv no-gzip 1
     SetEnv no-brotli 1
+</Directory>
+```
+
+### Static site with mod_deflate
+
+For a static site where mod_deflate compresses `.js`, `.css`, and `.html` on the fly, no extra configuration is needed. The module automatically emits `Repr-Digest` for compressed responses and `Content-Digest` for uncompressed ones.
+
+```apache
+<Directory "/usr/local/www/my-app">
+    DigestFields On
 </Directory>
 ```
 
@@ -389,16 +399,19 @@ On FreeBSD, use `shasum -a 256` or `sha256` instead of `sha256sum`. On macOS, us
 
 ### mod_deflate / mod_brotli
 
-If Apache compresses a response on the fly, the `Content-Digest` header will contain the hash of the *original file*, not the compressed bytes the client receives. This violates RFC 9530 semantics.
+The module is fully compatible with on-the-fly compression. When mod_deflate or mod_brotli compresses a response, the module automatically emits the sidecar hash as `Repr-Digest` instead of `Content-Digest`. This is the correct RFC 9530 behavior -- the sidecar hash represents the selected representation before content-encoding, not the compressed bytes on the wire.
 
-**Solution:** Disable on-the-fly compression for directories where `DigestFields` is enabled:
+```
+No compression  →  Content-Digest: sha-256=:hash:    (hash of file = bytes on wire)
+With gzip/br    →  Repr-Digest: sha-256=:hash:       (hash of file = representation)
+```
+
+For mirror servers serving pre-compressed archives (`.tar.gz`, `.tar.xz`), you may still want to disable on-the-fly compression to prevent double-compression:
 
 ```apache
 SetEnv no-gzip 1
 SetEnv no-brotli 1
 ```
-
-This is the expected configuration for mirror servers serving pre-compressed archives.
 
 ### Symlinks
 
