@@ -35,6 +35,9 @@
 
 #define CHECKSUM_MAX_FILE_SIZE 1024
 #define CHECKSUM_ENABLED_UNSET -1
+#define DIGEST_FIELDS_FILTER "DIGEST_FIELDS"
+#define NOTE_DIGEST_VALUE "mod_digest_fields::digest_value"
+#define NOTE_REPR_VALUE "mod_digest_fields::repr_value"
 
 /* Algorithm definitions */
 typedef struct {
@@ -716,15 +719,13 @@ static int content_digest_fixup_handler(request_rec *r)
             continue;
         }
 
-        /* Success - add Content-Digest header */
+        /* Success - stash digest value for the output filter to emit
+         * as Content-Digest or Repr-Digest depending on Content-Encoding */
         header_value = format_header_value(r, algo, hex_hash);
-        apr_table_set(r->headers_out, "Content-Digest", header_value);
-        /* A compression filter may change the bytes on the wire, so the
-         * Content-Digest varies by encoding */
-        apr_table_mergen(r->headers_out, "Vary", "Accept-Encoding");
+        apr_table_set(r->notes, NOTE_DIGEST_VALUE, header_value);
 
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-            "mod_digest_fields: added Content-Digest: %s for %s",
+            "mod_digest_fields: found sidecar digest: %s for %s",
             header_value, r->filename);
 
         break;  /* Use first found algorithm */
@@ -770,12 +771,12 @@ static int content_digest_fixup_handler(request_rec *r)
                     continue;
                 }
 
-                /* Success - add Repr-Digest header */
+                /* Success - stash repr digest for the output filter */
                 header_value = format_header_value(r, algo, hex_hash);
-                apr_table_set(r->headers_out, "Repr-Digest", header_value);
+                apr_table_set(r->notes, NOTE_REPR_VALUE, header_value);
 
                 ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                    "mod_digest_fields: added Repr-Digest: %s for %s (repr of %s)",
+                    "mod_digest_fields: found repr sidecar digest: %s for %s (repr of %s)",
                     header_value, r->filename, base_filename);
 
                 break;  /* Use first found algorithm */
@@ -783,12 +784,93 @@ static int content_digest_fixup_handler(request_rec *r)
         }
     }
 
+    /* Add output filter if we found any digest to emit.
+     * The filter runs after mod_deflate (AP_FTYPE_PROTOCOL > AP_FTYPE_CONTENT_SET)
+     * so it can check Content-Encoding to choose the correct header name. */
+    if (apr_table_get(r->notes, NOTE_DIGEST_VALUE) != NULL ||
+        apr_table_get(r->notes, NOTE_REPR_VALUE) != NULL) {
+        ap_add_output_filter(DIGEST_FIELDS_FILTER, NULL, r, r->connection);
+    }
+
     return DECLINED;
+}
+
+/*
+ * Output filter: emit digest headers after Content-Encoding is known.
+ *
+ * Runs at AP_FTYPE_PROTOCOL (after mod_deflate at AP_FTYPE_CONTENT_SET).
+ * By this point, Content-Encoding is set if compression happened.
+ *
+ * Per RFC 9530:
+ *   Content-Digest = hash of the message content (bytes on the wire)
+ *   Repr-Digest    = hash of the selected representation (before content-encoding)
+ *
+ * When mod_deflate compresses a response, our sidecar hash (of the file on disk)
+ * is the representation hash, not the content hash. We emit it as Repr-Digest.
+ * When no compression occurs, the file bytes ARE the wire bytes: Content-Digest.
+ */
+static apr_status_t digest_fields_output_filter(ap_filter_t *f,
+                                                apr_bucket_brigade *bb)
+{
+    request_rec *r = f->r;
+    const char *digest_value;
+    const char *repr_value;
+    const char *content_encoding;
+
+    /* Only run once - remove ourselves immediately */
+    ap_remove_output_filter(f);
+
+    digest_value = apr_table_get(r->notes, NOTE_DIGEST_VALUE);
+    repr_value = apr_table_get(r->notes, NOTE_REPR_VALUE);
+
+    if (digest_value == NULL && repr_value == NULL) {
+        return ap_pass_brigade(f->next, bb);
+    }
+
+    content_encoding = apr_table_get(r->headers_out, "Content-Encoding");
+
+    if (digest_value != NULL) {
+        if (content_encoding != NULL && *content_encoding != '\0') {
+            /* On-the-fly compression: sidecar hash is of the representation
+             * (the file on disk, before content-encoding), not the encoded
+             * bytes on the wire. Per RFC 9530, this is Repr-Digest. */
+            apr_table_set(r->headers_out, "Repr-Digest", digest_value);
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                "mod_digest_fields: Content-Encoding '%s' present, "
+                "emitting sidecar hash as Repr-Digest: %s",
+                content_encoding, digest_value);
+        } else {
+            /* No content encoding: bytes on wire match file on disk.
+             * Per RFC 9530, this is Content-Digest. */
+            apr_table_set(r->headers_out, "Content-Digest", digest_value);
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                "mod_digest_fields: no Content-Encoding, "
+                "emitting sidecar hash as Content-Digest: %s",
+                digest_value);
+        }
+        /* Response varies by encoding: different Accept-Encoding may change
+         * whether we emit Content-Digest or Repr-Digest */
+        apr_table_mergen(r->headers_out, "Vary", "Accept-Encoding");
+    }
+
+    /* Repr-Digest from pre-compressed file's base sidecar (DigestFieldsRepr).
+     * This is set when the file on disk has a compression extension (e.g., .gz)
+     * and a sidecar exists for the stripped base filename (e.g., .tar). */
+    if (repr_value != NULL) {
+        apr_table_set(r->headers_out, "Repr-Digest", repr_value);
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+            "mod_digest_fields: emitting Repr-Digest from repr sidecar: %s",
+            repr_value);
+    }
+
+    return ap_pass_brigade(f->next, bb);
 }
 
 /* Register hooks */
 static void content_digest_register_hooks(apr_pool_t *p)
 {
+    ap_register_output_filter(DIGEST_FIELDS_FILTER, digest_fields_output_filter,
+                              NULL, AP_FTYPE_PROTOCOL);
     ap_hook_fixups(content_digest_fixup_handler, NULL, NULL, APR_HOOK_MIDDLE);
 }
 
